@@ -3,9 +3,26 @@
 pragma solidity >=0.6.0 <0.8.0;
 
 
-import "./UInt256Lib.sol";
 pragma solidity >=0.6.0 <0.8.0;
+/**
+ * @title Various utilities useful for uint256.
+ */
+library UInt256Lib {
 
+    uint256 private constant MAX_INT256 = ~(uint256(1) << 255);
+
+    /**
+     * @dev Safely converts a uint256 to an int256.
+     */
+    function toInt256Safe(uint256 a)
+        internal
+        pure
+        returns (int256)
+    {
+        require(a <= MAX_INT256);
+        return int256(a);
+    }
+}
 /*
  * @dev Provides information about the current execution context, including the
  * sender of the transaction and its data. While these are generally available
@@ -1161,6 +1178,11 @@ interface IOracle {
     function update() external;
 }
 
+interface IDIAOracle {
+    function getValue(string memory) external view returns (uint128, uint128);
+    function setValue(string memory, uint128, uint128) external;
+}
+
 interface ISync {
     function sync() external;
 }
@@ -1182,6 +1204,7 @@ interface IGulp {
  */
 contract D100TokenMonetaryPolicy is Ownable {
     using SafeMath for uint256;
+    using SafeMath for uint128;
     using SafeMathInt for int256;
     using UInt256Lib for uint256;
 
@@ -1198,12 +1221,9 @@ contract D100TokenMonetaryPolicy is Ownable {
 
     uint256 public incentiveLimit = 300 * 1e9;
 
-    // Provides the current market cap, as an 18 decimal fixed point number.
-    IOracle public mktcapOracle;
-
     // Market oracle provides the token/USD exchange rate as an 18 decimal fixed point number.
-    // (eg) An oracle value of 1.5e18 it would mean 1 D100 is trading for $1.50.
-    IOracle public tokenPriceOracle;
+    // (eg) An oracle value of 1.5e5 it would mean 1 D100 is trading for $1.50.
+    IDIAOracle public diaOracle;
 
     // If the current exchange rate is within this fractional distance from the target, no supply
     // update is performed. Fixed point number--same format as the rate.
@@ -1261,13 +1281,13 @@ contract D100TokenMonetaryPolicy is Ownable {
         require(inRebaseWindow(), "the rebase window is closed");
 
         // This comparison also ensures there is no reentrancy.
-        require(lastRebaseTimestampSec.add(minRebaseTimeIntervalSec) < now, "cannot rebase yet");
+        require(lastRebaseTimestampSec.add(minRebaseTimeIntervalSec) < block.timestamp, "cannot rebase yet");
 
 
         uint256 incentive = calcIncentive();
 
         // Snap the rebase time to the start of this window.
-        lastRebaseTimestampSec = now.sub(now.mod(minRebaseTimeIntervalSec)).add(rebaseWindowOffsetSec);
+        lastRebaseTimestampSec = block.timestamp.sub(block.timestamp.mod(minRebaseTimeIntervalSec)).add(rebaseWindowOffsetSec);
 
          if (incentive > 0) {
             D100.transfer(msg.sender, incentive); // before rebase()
@@ -1278,10 +1298,8 @@ contract D100TokenMonetaryPolicy is Ownable {
 
         (int256 supplyDelta, uint256 mktcap, uint256 tokenPrice) = getNextSupplyDelta();
 
-        tokenPriceOracle.update();
-
         if (supplyDelta == 0) {
-            emit LogRebase(epoch, tokenPrice, mktcap, supplyDelta, now);
+            emit LogRebase(epoch, tokenPrice, mktcap, supplyDelta, block.timestamp);
             return;
         }
 
@@ -1294,15 +1312,15 @@ contract D100TokenMonetaryPolicy is Ownable {
         
         sync();
         
-        emit LogRebase(epoch, tokenPrice, mktcap, supplyDelta, now);
+        emit LogRebase(epoch, tokenPrice, mktcap, supplyDelta, block.timestamp);
     }
 
 
     function calcIncentive() public view returns (uint256 incentive) {
-        if (inRebaseWindow() && now > lastRebaseTimestampSec.add(minRebaseTimeIntervalSec)) {
+        if (inRebaseWindow() && block.timestamp > lastRebaseTimestampSec.add(minRebaseTimeIntervalSec)) {
             uint256 D100Balance = D100.balanceOf(address(this));
             uint256 realLimit = D100Balance <= incentiveLimit ? D100Balance : incentiveLimit;
-            uint256 auction_price = now.mod(minRebaseTimeIntervalSec).sub(rebaseWindowOffsetSec).div(5).mul(1e9); 
+            uint256 auction_price = block.timestamp.mod(minRebaseTimeIntervalSec).sub(rebaseWindowOffsetSec).div(5).mul(1e9); 
             incentive = auction_price <= realLimit ? auction_price : realLimit;
         } else { 
             incentive = 0;
@@ -1319,23 +1337,25 @@ contract D100TokenMonetaryPolicy is Ownable {
 
     function getNextSupplyDelta()
         public view
-        returns (int256 supplyDelta, uint256 mktcap, uint256 tokenPrice)
+        returns (int256, uint256, uint256)
     {
-        uint256 mktcap;
-        bool mktcapValid;
-        (mktcap, mktcapValid) = mktcapOracle.getData();
-        require(mktcapValid, "invalid mktcap");
+        uint128 mktcapFromOracle = 0;
+        uint128 mktcapUpdated = 0;
+        (mktcapFromOracle, mktcapUpdated) = diaOracle.getValue("Defi100");
+        require(block.timestamp - mktcapUpdated < 90000, "invalid mktcap");
 
-        uint256 tokenPrice;
-        bool tokenPriceValid;
-        (tokenPrice, tokenPriceValid) = tokenPriceOracle.getData();
-        require(tokenPriceValid, "invalid token price");
+        uint128 tokenPriceFromOracle = 0;
+        uint128 tokenPriceUpdated = 0;
+        (tokenPriceFromOracle, tokenPriceUpdated) = diaOracle.getValue("D100");
+        require(block.timestamp.sub(tokenPriceUpdated) < 90000, "invalid token price");
 
+        uint256 mktcap = (uint256)(mktcapFromOracle).mul(10 ** (DECIMALS - 5));
+        uint256 tokenPrice = (uint256)(tokenPriceFromOracle).mul(10 ** (DECIMALS - 5));
         if (tokenPrice > MAX_RATE) {
             tokenPrice = MAX_RATE;
         }
 
-        supplyDelta = computeSupplyDelta(tokenPrice, mktcap);
+        int256 supplyDelta = computeSupplyDelta(tokenPrice, mktcap);
 
         // Apply the Dampening factor.
         supplyDelta = supplyDelta.div(rebaseLag.toInt256Safe());
@@ -1368,26 +1388,16 @@ contract D100TokenMonetaryPolicy is Ownable {
         }
     }
     
-    /**
-     * @notice Sets the reference to the market cap oracle.
-     * @param mktcapOracle_ The address of the mktcap oracle contract.
-     */
-    function setmktcapOracle(IOracle mktcapOracle_)
-        external
-        onlyOwner
-    {
-        mktcapOracle = mktcapOracle_;
-    }
 
     /**
      * @notice Sets the reference to the token price oracle.
-     * @param tokenPriceOracle_ The address of the token price oracle contract.
+     * @param diaOracle_ The address of the token price oracle contract.
      */
-    function setTokenPriceOracle(IOracle tokenPriceOracle_)
+    function setDIAOracle(IDIAOracle diaOracle_)
         external
         onlyOwner
     {
-        tokenPriceOracle = tokenPriceOracle_;
+        diaOracle = diaOracle_;
     }
 
     function setIncentiveLimit(uint256 newIncentiveLimit)
@@ -1453,7 +1463,7 @@ contract D100TokenMonetaryPolicy is Ownable {
         rebaseWindowLengthSec = rebaseWindowLengthSec_;
     }
 
-    constructor (D100Token D100_, IOracle tokenPriceOracle_, IOracle mktcapOracle_)
+    constructor (D100Token D100_, IDIAOracle diaOracle_)
         public
     {
         deviationThreshold = 0;
@@ -1466,9 +1476,7 @@ contract D100TokenMonetaryPolicy is Ownable {
         epoch = 0;
 
         D100 = D100_;
-        tokenPriceOracle = tokenPriceOracle_;
-        mktcapOracle = mktcapOracle_;
-        
+        diaOracle = diaOracle_;
     }
 
     /**
@@ -1477,8 +1485,8 @@ contract D100TokenMonetaryPolicy is Ownable {
      */
     function inRebaseWindow() public view returns (bool) {
         return (
-            now.mod(minRebaseTimeIntervalSec) >= rebaseWindowOffsetSec &&
-            now.mod(minRebaseTimeIntervalSec) < (rebaseWindowOffsetSec.add(rebaseWindowLengthSec))
+            block.timestamp.mod(minRebaseTimeIntervalSec) >= rebaseWindowOffsetSec &&
+            block.timestamp.mod(minRebaseTimeIntervalSec) < (rebaseWindowOffsetSec.add(rebaseWindowLengthSec))
         );
     }
 
